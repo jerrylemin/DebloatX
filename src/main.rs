@@ -7,8 +7,10 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use debloatx::{
-    HistoryItem, ItemStatus, OperationHistory, OperationStatus, ScanReport, format_bytes,
-    load_history, local_storage_root, quarantine_files, restore_operation, scan_folder,
+    HistoryItem, ItemStatus, OperationHistory, OperationStatus, RegistryValue, ScanReport,
+    SettingHistory, SettingStatus, apply_show_file_extensions, format_bytes, load_history,
+    load_setting_history, local_storage_root, quarantine_files, restore_operation, restore_setting,
+    scan_folder, show_file_extensions_value,
 };
 use eframe::egui::{self, Color32, RichText, Stroke, Theme, Vec2};
 
@@ -44,6 +46,8 @@ enum WorkerMessage {
     ApplyFinished(io::Result<OperationHistory>),
     RestoreProgress(usize, usize),
     RestoreFinished(io::Result<OperationHistory>),
+    SettingApplyFinished(io::Result<SettingHistory>),
+    SettingRestoreFinished(io::Result<SettingHistory>),
 }
 
 struct Worker {
@@ -57,8 +61,12 @@ struct DebloatApp {
     storage_error: Option<String>,
     scan: Option<ScanReport>,
     history: Vec<OperationHistory>,
+    setting_history: Vec<SettingHistory>,
     worker: Option<Worker>,
     confirm_quarantine: bool,
+    confirm_extensions: Option<Option<RegistryValue>>,
+    confirm_setting_restore: Option<String>,
+    extension_value: Option<Result<Option<RegistryValue>, String>>,
     progress: (usize, usize),
     progress_label: String,
     notice: Option<String>,
@@ -76,8 +84,12 @@ impl DebloatApp {
                     storage_error: Some(error.to_string()),
                     scan: None,
                     history: Vec::new(),
+                    setting_history: Vec::new(),
                     worker: None,
                     confirm_quarantine: false,
+                    confirm_extensions: None,
+                    confirm_setting_restore: None,
+                    extension_value: None,
                     progress: (0, 0),
                     progress_label: String::new(),
                     notice: None,
@@ -88,17 +100,29 @@ impl DebloatApp {
             Ok(history) => (history, None),
             Err(error) => (Vec::new(), Some(format!("Không đọc được lịch sử: {error}"))),
         };
+        let (setting_history, setting_error) =
+            match load_setting_history(storage_root.as_ref().unwrap()) {
+                Ok(history) => (history, None),
+                Err(error) => (
+                    Vec::new(),
+                    Some(format!("Không đọc được lịch sử thiết lập: {error}")),
+                ),
+            };
         Self {
             page: Page::Overview,
             storage_root,
             storage_error: None,
             scan: None,
             history,
+            setting_history,
             worker: None,
             confirm_quarantine: false,
+            confirm_extensions: None,
+            confirm_setting_restore: None,
+            extension_value: None,
             progress: (0, 0),
             progress_label: String::new(),
-            notice: history_error,
+            notice: history_error.or(setting_error),
         }
     }
 
@@ -197,6 +221,42 @@ impl DebloatApp {
         self.notice = None;
     }
 
+    fn start_apply_extensions(&mut self, expected_previous: Option<RegistryValue>) {
+        let Some(storage_root) = self.storage_root.clone() else {
+            self.notice = self.storage_error.clone();
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        thread::spawn(move || {
+            let result = apply_show_file_extensions(&storage_root, expected_previous);
+            let _ = sender.send(WorkerMessage::SettingApplyFinished(result));
+        });
+        self.worker = Some(Worker { receiver, cancel });
+        self.progress = (0, 1);
+        self.progress_label = "Đang ghi nhật ký và áp dụng thiết lập Explorer".to_owned();
+        self.notice = None;
+        self.confirm_extensions = None;
+    }
+
+    fn start_restore_setting(&mut self, operation_id: String) {
+        let Some(storage_root) = self.storage_root.clone() else {
+            self.notice = self.storage_error.clone();
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        thread::spawn(move || {
+            let result = restore_setting(&storage_root, &operation_id);
+            let _ = sender.send(WorkerMessage::SettingRestoreFinished(result));
+        });
+        self.worker = Some(Worker { receiver, cancel });
+        self.progress = (0, 1);
+        self.progress_label = "Đang đối chiếu và khôi phục thiết lập Explorer".to_owned();
+        self.notice = None;
+        self.confirm_setting_restore = None;
+    }
+
     fn poll_worker(&mut self) {
         let messages: Vec<_> = self
             .worker
@@ -244,6 +304,35 @@ impl DebloatApp {
                     self.history = self.reload_history();
                     self.worker = None;
                 }
+                WorkerMessage::SettingApplyFinished(Ok(operation)) => {
+                    self.notice = Some(setting_message(&operation));
+                    self.setting_history = self.reload_setting_history();
+                    self.extension_value =
+                        Some(show_file_extensions_value().map_err(|e| e.to_string()));
+                    self.worker = None;
+                    self.page = Page::Recovery;
+                }
+                WorkerMessage::SettingApplyFinished(Err(error)) => {
+                    self.notice = Some(format!("Không áp dụng được thiết lập: {error}"));
+                    self.setting_history = self.reload_setting_history();
+                    self.extension_value =
+                        Some(show_file_extensions_value().map_err(|e| e.to_string()));
+                    self.worker = None;
+                }
+                WorkerMessage::SettingRestoreFinished(Ok(operation)) => {
+                    self.notice = Some(setting_message(&operation));
+                    self.setting_history = self.reload_setting_history();
+                    self.extension_value =
+                        Some(show_file_extensions_value().map_err(|e| e.to_string()));
+                    self.worker = None;
+                }
+                WorkerMessage::SettingRestoreFinished(Err(error)) => {
+                    self.notice = Some(format!("Không hoàn tất khôi phục thiết lập: {error}"));
+                    self.setting_history = self.reload_setting_history();
+                    self.extension_value =
+                        Some(show_file_extensions_value().map_err(|e| e.to_string()));
+                    self.worker = None;
+                }
             }
         }
     }
@@ -253,6 +342,18 @@ impl DebloatApp {
             .as_ref()
             .and_then(|root| load_history(root).ok())
             .unwrap_or_default()
+    }
+
+    fn reload_setting_history(&self) -> Vec<SettingHistory> {
+        self.storage_root
+            .as_ref()
+            .and_then(|root| load_setting_history(root).ok())
+            .unwrap_or_default()
+    }
+
+    fn refresh_extension_value(&mut self) {
+        self.extension_value =
+            Some(show_file_extensions_value().map_err(|error| error.to_string()));
     }
 
     fn cancel_worker(&mut self) {
@@ -318,6 +419,9 @@ impl DebloatApp {
                 self.page = page;
                 if page == Page::Recovery {
                     self.history = self.reload_history();
+                    self.setting_history = self.reload_setting_history();
+                } else if page == Page::Windows {
+                    self.refresh_extension_value();
                 }
             }
             ui.add_space(3.0);
@@ -558,9 +662,16 @@ impl DebloatApp {
 
     fn recovery(&mut self, ui: &mut egui::Ui) {
         ui.heading(RichText::new("Khôi phục").size(25.0));
-        ui.label("Khôi phục theo từng thao tác. Tệp gốc đã có sẽ không bị ghi đè.");
+        ui.label("Khôi phục thao tác tệp và thiết lập đã lưu. Xung đột được giữ nguyên để tránh ghi đè thay đổi mới.");
         ui.add_space(14.0);
-        if self.history.is_empty() {
+        if self.worker.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(&self.progress_label);
+            });
+            ui.add_space(8.0);
+        }
+        if self.history.is_empty() && self.setting_history.is_empty() {
             ui.label("Chưa có thao tác nào trong lịch sử.");
             return;
         }
@@ -633,6 +744,147 @@ impl DebloatApp {
         if let Some(operation_id) = restore_id {
             self.start_restore(operation_id);
         }
+        let mut restore_setting_id = None;
+        for operation in &self.setting_history {
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_rgb(24, 33, 43))
+                .corner_radius(egui::CornerRadius::same(12))
+                .inner_margin(egui::Margin::same(14))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(setting_status_label(operation.status)).strong(),
+                            );
+                            ui.label("Hiện phần mở rộng tệp · HKCU · Explorer 64-bit");
+                            ui.label(RichText::new(&operation.id).monospace().size(11.0));
+                            ui.label(format!(
+                                "Gốc: {} · Hiện tại: {}",
+                                registry_value_description(operation.original.as_ref()),
+                                registry_value_description(operation.current.as_ref())
+                            ));
+                            if let Some(message) = &operation.message {
+                                ui.colored_label(Color32::from_rgb(255, 176, 98), message);
+                            }
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    can_restore && operation.status == SettingStatus::Applied,
+                                    egui::Button::new("Xem trước khôi phục"),
+                                )
+                                .clicked()
+                            {
+                                restore_setting_id = Some(operation.id.clone());
+                            }
+                        });
+                    });
+                });
+            ui.add_space(8.0);
+        }
+        if let Some(operation_id) = restore_setting_id {
+            self.confirm_setting_restore = Some(operation_id);
+        }
+        if let Some(operation_id) = self.confirm_setting_restore.clone()
+            && let Some(original) = self
+                .setting_history
+                .iter()
+                .find(|item| item.id == operation_id)
+                .map(|item| item.original.clone())
+        {
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_rgb(35, 41, 48))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(220, 162, 84)))
+                .corner_radius(egui::CornerRadius::same(14))
+                .inner_margin(egui::Margin::same(18))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("XEM TRƯỚC · XÁC NHẬN").strong().color(Color32::from_rgb(242, 189, 112)));
+                    ui.heading("Khôi phục thiết lập đã lưu?");
+                    ui.label(format!("Giá trị gốc: {}", registry_value_description(original.as_ref())));
+                    ui.label("Khôi phục chỉ tiếp tục nếu HideFileExt vẫn bằng giá trị DebloatX đã áp dụng.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Quay lại").clicked() {
+                            self.confirm_setting_restore = None;
+                        }
+                        if ui.add_enabled(self.worker.is_none(), egui::Button::new("Xác nhận khôi phục thiết lập")).clicked() {
+                            self.start_restore_setting(operation_id.clone());
+                        }
+                    });
+                });
+        }
+    }
+
+    fn windows_settings(&mut self, ui: &mut egui::Ui) {
+        if self.extension_value.is_none() {
+            self.refresh_extension_value();
+        }
+        ui.heading(RichText::new("Thiết lập Windows").size(25.0));
+        ui.add_space(8.0);
+        ui.label("Hiện phần mở rộng cho các loại tệp đã biết trong File Explorer.");
+        ui.label("Phạm vi: tài khoản Windows hiện tại · HKCU · chế độ xem registry 64-bit · không cần quyền quản trị.");
+        ui.add_space(12.0);
+
+        if self.worker.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(&self.progress_label);
+            });
+        }
+        match self.extension_value.clone() {
+            Some(Ok(Some(value))) if value == shown_extensions_value_ui() => {
+                ui.label("Trạng thái: phần mở rộng hiện đã được hiển thị.");
+            }
+            Some(Ok(value)) => {
+                ui.label(format!(
+                    "HideFileExt hiện tại: {}",
+                    registry_value_description(value.as_ref())
+                ));
+            }
+            Some(Err(error)) => {
+                ui.colored_label(
+                    Color32::from_rgb(255, 176, 98),
+                    format!("Không đọc được HKCU Explorer Advanced: {error}"),
+                );
+            }
+            None => {}
+        }
+        ui.add_space(10.0);
+
+        if let Some(expected_previous) = self.confirm_extensions.clone() {
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_rgb(35, 41, 48))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(220, 162, 84)))
+                .corner_radius(egui::CornerRadius::same(14))
+                .inner_margin(egui::Margin::same(18))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("XEM TRƯỚC · XÁC NHẬN").strong().color(Color32::from_rgb(242, 189, 112)));
+                    ui.heading("Hiện phần mở rộng tệp?");
+                    ui.label("Sẽ đặt HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\\HideFileExt thành REG_DWORD 0.");
+                    ui.label(format!("Giá trị gốc được lưu nguyên type và bytes: {}", registry_value_description(expected_previous.as_ref())));
+                    ui.label("DebloatX ghi journal trước khi sửa và chỉ khôi phục nếu giá trị vẫn khớp. Explorer có thể cần được mở lại để cập nhật giao diện.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Quay lại").clicked() {
+                            self.confirm_extensions = None;
+                        }
+                        if ui.add_enabled(self.worker.is_none(), egui::Button::new("Xác nhận áp dụng")).clicked() {
+                            self.start_apply_extensions(expected_previous);
+                        }
+                    });
+                });
+        } else if let Some(Ok(value)) = self.extension_value.clone()
+            && value.as_ref() != Some(&shown_extensions_value_ui())
+            && ui
+                .add_enabled(
+                    self.worker.is_none(),
+                    egui::Button::new("Xem trước thay đổi"),
+                )
+                .clicked()
+        {
+            self.confirm_extensions = Some(value);
+        }
+        if ui.button("Đọc lại trạng thái").clicked() && self.worker.is_none() {
+            self.refresh_extension_value();
+        }
     }
 
     fn placeholder(&mut self, ui: &mut egui::Ui, title: &str) {
@@ -660,10 +912,10 @@ impl eframe::App for DebloatApp {
             .show(ui, |ui| match self.page {
                 Page::Overview => self.overview(ui),
                 Page::Cleanup => self.cleanup(ui),
+                Page::Windows => self.windows_settings(ui),
                 Page::Recovery => self.recovery(ui),
                 Page::Applications => self.placeholder(ui, "Ứng dụng"),
                 Page::Drives => self.placeholder(ui, "Ổ đĩa"),
-                Page::Windows => self.placeholder(ui, "Windows"),
                 Page::Drivers => self.placeholder(ui, "Driver"),
             });
         if self.worker.is_some() {
@@ -714,6 +966,53 @@ fn status_label(status: OperationStatus) -> &'static str {
         OperationStatus::Cancelled => "Đã hủy",
         OperationStatus::Restored => "Đã khôi phục",
         OperationStatus::Interrupted => "Đã gián đoạn · cần đối chiếu",
+    }
+}
+
+fn shown_extensions_value_ui() -> RegistryValue {
+    RegistryValue {
+        kind: 4,
+        data: 0_u32.to_le_bytes().to_vec(),
+    }
+}
+
+fn registry_value_description(value: Option<&RegistryValue>) -> String {
+    match value {
+        None => "không tồn tại".to_owned(),
+        Some(value) => {
+            let bytes = value
+                .data
+                .iter()
+                .take(16)
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let suffix = if value.data.len() > 16 { " …" } else { "" };
+            format!(
+                "type {} · {} bytes · {bytes}{suffix}",
+                value.kind,
+                value.data.len()
+            )
+        }
+    }
+}
+
+fn setting_status_label(status: SettingStatus) -> &'static str {
+    match status {
+        SettingStatus::Running => "Đang xử lý",
+        SettingStatus::Applied => "Đã áp dụng · có thể khôi phục",
+        SettingStatus::Restored => "Đã về giá trị gốc",
+        SettingStatus::Failed => "Không hoàn tất · cần kiểm tra",
+        SettingStatus::Conflict => "Xung đột · giữ nguyên giá trị hiện tại",
+        SettingStatus::Interrupted => "Bị gián đoạn · cần đối chiếu",
+    }
+}
+
+fn setting_message(operation: &SettingHistory) -> String {
+    let status = setting_status_label(operation.status);
+    match &operation.message {
+        Some(message) => format!("{status} · {message}"),
+        None => status.to_owned(),
     }
 }
 

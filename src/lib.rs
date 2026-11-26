@@ -8,17 +8,31 @@ use std::os::windows::fs::MetadataExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Component, Path, PathBuf};
+use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW,
     GetFileInformationByHandle,
 };
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_WOW64_64KEY, REG_DWORD,
+    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+};
+#[cfg(test)]
+use windows_sys::Win32::System::Registry::{
+    REG_BINARY, REG_CREATED_NEW_KEY, RegCreateKeyExW, RegDeleteTreeW,
+};
 use windows_sys::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE};
 
 pub const QUARANTINE_OPERATION_ID: &str = "cleanup.quarantine-files.v1";
+pub const SHOW_FILE_EXTENSIONS_OPERATION_ID: &str = "windows.show-file-extensions.v1";
+const EXPLORER_ADVANCED_KEY: &str =
+    "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced";
+const HIDE_FILE_EXT_VALUE: &str = "HideFileExt";
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 static NEXT_OPERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -104,6 +118,50 @@ pub struct OperationHistory {
     pub root: PathBuf,
     pub status: OperationStatus,
     pub items: Vec<HistoryItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryValue {
+    pub kind: u32,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingStatus {
+    Running,
+    Applied,
+    Restored,
+    Failed,
+    Conflict,
+    Interrupted,
+}
+
+#[derive(Clone, Debug)]
+pub struct SettingHistory {
+    pub id: String,
+    pub operation_id: String,
+    pub created_unix_seconds: u64,
+    pub original: Option<RegistryValue>,
+    pub current: Option<RegistryValue>,
+    pub status: SettingStatus,
+    pub message: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SettingManifest {
+    id: String,
+    operation_id: String,
+    created_unix_seconds: u64,
+    key_existed: bool,
+    registry_view: u32,
+    original: Option<RegistryValue>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SettingJournalEvent {
+    status: SettingStatus,
+    message: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -611,6 +669,538 @@ pub fn load_history(storage_root: &Path) -> io::Result<Vec<OperationHistory>> {
     Ok(history)
 }
 
+pub fn show_file_extensions_value() -> io::Result<Option<RegistryValue>> {
+    read_explorer_value()
+}
+
+pub fn apply_show_file_extensions(
+    storage_root: &Path,
+    expected_previous: Option<RegistryValue>,
+) -> io::Result<SettingHistory> {
+    prepare_storage(storage_root)?;
+    let current = read_explorer_value()?;
+    if current != expected_previous {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "thiết lập đã thay đổi sau khi xem trước; hãy kiểm tra lại",
+        ));
+    }
+    let applied = shown_extensions_value();
+    if current.as_ref() == Some(&applied) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "phần mở rộng đã được hiển thị",
+        ));
+    }
+
+    let history_root = storage_root.join("settings-history");
+    if !history_root.exists() {
+        fs::create_dir(&history_root)?;
+    }
+    let root_metadata = fs::symlink_metadata(&history_root)?;
+    if !root_metadata.is_dir() || is_reparse_point(&root_metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "thư mục lịch sử thiết lập không hợp lệ",
+        ));
+    }
+
+    let id = new_operation_id();
+    let operation_dir = history_root.join(&id);
+    fs::create_dir(&operation_dir)?;
+    let manifest = SettingManifest {
+        id,
+        operation_id: SHOW_FILE_EXTENSIONS_OPERATION_ID.to_owned(),
+        created_unix_seconds: now_unix_seconds(),
+        key_existed: true,
+        registry_view: KEY_WOW64_64KEY,
+        original: current,
+    };
+    write_setting_manifest(&operation_dir, &manifest)?;
+    append_setting_event(
+        &operation_dir,
+        SettingJournalEvent {
+            status: SettingStatus::Running,
+            message: None,
+        },
+    )?;
+
+    let result = write_explorer_value(Some(&applied));
+    let observed = read_explorer_value();
+    let (status, message) = match observed {
+        Ok(Some(value)) if value == applied => (SettingStatus::Applied, None),
+        Ok(value) if value == manifest.original => (
+            SettingStatus::Failed,
+            result.err().map(|error| error.to_string()).or_else(|| {
+                Some("Windows không lưu giá trị dự kiến; giá trị ban đầu vẫn còn.".to_owned())
+            }),
+        ),
+        Ok(_) => (
+            SettingStatus::Conflict,
+            Some("giá trị đã đổi trong lúc áp dụng; không ghi đè giá trị mới".to_owned()),
+        ),
+        Err(error) => (
+            SettingStatus::Interrupted,
+            Some(format!(
+                "không đọc lại được registry sau khi áp dụng: {error}"
+            )),
+        ),
+    };
+    append_setting_event(&operation_dir, SettingJournalEvent { status, message })?;
+    setting_history_for_dir(&operation_dir)
+}
+
+pub fn load_setting_history(storage_root: &Path) -> io::Result<Vec<SettingHistory>> {
+    let history_root = storage_root.join("settings-history");
+    let metadata = match fs::symlink_metadata(&history_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() || is_reparse_point(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "thư mục lịch sử thiết lập không hợp lệ",
+        ));
+    }
+    let mut history = Vec::new();
+    for entry in fs::read_dir(history_root)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_dir() && !is_reparse_point(&metadata) {
+            history.push(setting_history_for_dir(&entry.path())?);
+        }
+    }
+    history.sort_by_key(|operation| std::cmp::Reverse(operation.created_unix_seconds));
+    Ok(history)
+}
+
+pub fn restore_setting(storage_root: &Path, operation_id: &str) -> io::Result<SettingHistory> {
+    if operation_id.is_empty()
+        || !operation_id
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ch == '-')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ID thao tác không hợp lệ",
+        ));
+    }
+    let operation_dir = storage_root.join("settings-history").join(operation_id);
+    let manifest = read_setting_manifest(&operation_dir)?;
+    let history = load_setting_history(storage_root)?;
+    if latest_applied_setting_id(&history).is_some_and(|latest| latest != operation_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "có lần áp dụng mới hơn đang hoạt động; hãy khôi phục mục mới nhất trước",
+        ));
+    }
+    let current = read_explorer_value()?;
+    match registry_restore_decision(
+        current.as_ref(),
+        manifest.original.as_ref(),
+        &shown_extensions_value(),
+    ) {
+        RegistryRestoreDecision::AlreadyRestored => {
+            append_setting_event(
+                &operation_dir,
+                SettingJournalEvent {
+                    status: SettingStatus::Restored,
+                    message: None,
+                },
+            )?;
+        }
+        RegistryRestoreDecision::Restore => {
+            append_setting_event(
+                &operation_dir,
+                SettingJournalEvent {
+                    status: SettingStatus::Running,
+                    message: None,
+                },
+            )?;
+            // shortcut: registry writes have no compare-and-swap; after-write verification catches only races that remain visible.
+            let result = write_explorer_value(manifest.original.as_ref());
+            let observed = read_explorer_value();
+            let (status, message) = match observed {
+                Ok(value) if value == manifest.original => (SettingStatus::Restored, None),
+                Ok(Some(value)) if value == shown_extensions_value() => {
+                    let (status, message) = match result {
+                        Err(error) => (SettingStatus::Failed, error.to_string()),
+                        Ok(()) => (
+                            SettingStatus::Interrupted,
+                            "Windows báo ghi thành công nhưng giá trị gốc chưa xuất hiện; có thể thử lại sau khi đối chiếu.".to_owned(),
+                        ),
+                    };
+                    (status, Some(message))
+                }
+                Ok(_) => (
+                    SettingStatus::Conflict,
+                    Some("giá trị đã đổi trong lúc khôi phục; không ghi đè giá trị mới".to_owned()),
+                ),
+                Err(error) => (
+                    SettingStatus::Interrupted,
+                    Some(result.err().map_or_else(
+                        || format!("không đọc lại được registry sau khi khôi phục: {error}"),
+                        |e| e.to_string(),
+                    )),
+                ),
+            };
+            append_setting_event(&operation_dir, SettingJournalEvent { status, message })?;
+        }
+        RegistryRestoreDecision::Conflict => {
+            append_setting_event(
+                &operation_dir,
+                SettingJournalEvent {
+                    status: SettingStatus::Conflict,
+                    message: Some(
+                        "giá trị hiện tại khác cả giá trị đã áp dụng và giá trị gốc; cần kiểm tra thủ công"
+                            .to_owned(),
+                    ),
+                },
+            )?;
+        }
+    }
+    setting_history_for_dir(&operation_dir)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegistryRestoreDecision {
+    AlreadyRestored,
+    Restore,
+    Conflict,
+}
+
+fn registry_restore_decision(
+    current: Option<&RegistryValue>,
+    original: Option<&RegistryValue>,
+    applied: &RegistryValue,
+) -> RegistryRestoreDecision {
+    if current == original {
+        RegistryRestoreDecision::AlreadyRestored
+    } else if current == Some(applied) {
+        RegistryRestoreDecision::Restore
+    } else {
+        RegistryRestoreDecision::Conflict
+    }
+}
+
+fn setting_operation_order(id: &str) -> Option<(u128, u32, u64)> {
+    let mut parts = id.split('-');
+    let order = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    (parts.next().is_none() && order.0 != 0).then_some(order)
+}
+
+fn latest_applied_setting_id(history: &[SettingHistory]) -> Option<&str> {
+    history
+        .iter()
+        .filter(|operation| operation.status == SettingStatus::Applied)
+        .max_by_key(|operation| setting_operation_order(&operation.id))
+        .map(|operation| operation.id.as_str())
+}
+
+fn shown_extensions_value() -> RegistryValue {
+    RegistryValue {
+        kind: REG_DWORD,
+        data: 0_u32.to_le_bytes().to_vec(),
+    }
+}
+
+fn read_explorer_value() -> io::Result<Option<RegistryValue>> {
+    read_registry_value(EXPLORER_ADVANCED_KEY, HIDE_FILE_EXT_VALUE)
+}
+
+fn read_registry_value(key_path: &str, value_name: &str) -> io::Result<Option<RegistryValue>> {
+    with_registry_key(key_path, KEY_QUERY_VALUE, |key| {
+        let name = value_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        for _ in 0..3 {
+            let mut kind = 0;
+            let mut length = 0;
+            // SAFETY: key is open, name is nul-terminated, and output pointers are valid.
+            let status = unsafe {
+                RegQueryValueExW(
+                    key,
+                    name.as_ptr(),
+                    null(),
+                    &mut kind,
+                    null_mut(),
+                    &mut length,
+                )
+            };
+            if status == ERROR_FILE_NOT_FOUND {
+                return Ok(None);
+            }
+            if status != ERROR_SUCCESS {
+                return Err(io::Error::from_raw_os_error(status as i32));
+            }
+            if length > 1_048_576 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "giá trị registry vượt quá 1 MiB",
+                ));
+            }
+            let mut data = vec![0; length as usize];
+            let mut actual_length = length;
+            // SAFETY: data has length bytes and its pointer remains valid for the call.
+            let status = unsafe {
+                RegQueryValueExW(
+                    key,
+                    name.as_ptr(),
+                    null(),
+                    &mut kind,
+                    if data.is_empty() {
+                        null_mut()
+                    } else {
+                        data.as_mut_ptr()
+                    },
+                    &mut actual_length,
+                )
+            };
+            if status == ERROR_MORE_DATA {
+                continue;
+            }
+            if status != ERROR_SUCCESS {
+                return Err(io::Error::from_raw_os_error(status as i32));
+            }
+            data.truncate(actual_length as usize);
+            return Ok(Some(RegistryValue { kind, data }));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "giá trị registry liên tục thay đổi khi đọc",
+        ))
+    })
+}
+
+fn write_explorer_value(value: Option<&RegistryValue>) -> io::Result<()> {
+    write_registry_value(EXPLORER_ADVANCED_KEY, HIDE_FILE_EXT_VALUE, value)
+}
+
+fn write_registry_value(
+    key_path: &str,
+    value_name: &str,
+    value: Option<&RegistryValue>,
+) -> io::Result<()> {
+    with_registry_key(key_path, KEY_SET_VALUE, |key| {
+        let name = value_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let status = match value {
+            Some(value) => {
+                let length = u32::try_from(value.data.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "giá trị registry quá lớn")
+                })?;
+                // SAFETY: key and name are valid; data points to length bytes for the call.
+                unsafe {
+                    RegSetValueExW(
+                        key,
+                        name.as_ptr(),
+                        0,
+                        value.kind,
+                        if value.data.is_empty() {
+                            null()
+                        } else {
+                            value.data.as_ptr()
+                        },
+                        length,
+                    )
+                }
+            }
+            None => {
+                // SAFETY: key is open and name is a nul-terminated value name.
+                unsafe { RegDeleteValueW(key, name.as_ptr()) }
+            }
+        };
+        if status == ERROR_SUCCESS || (value.is_none() && status == ERROR_FILE_NOT_FOUND) {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status as i32))
+        }
+    })
+}
+
+fn with_registry_key<T>(
+    key_path: &str,
+    access: u32,
+    action: impl FnOnce(HKEY) -> io::Result<T>,
+) -> io::Result<T> {
+    let path = key_path
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut key = null_mut();
+    // SAFETY: path is nul-terminated and key points to writable storage.
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            path.as_ptr(),
+            0,
+            access | KEY_WOW64_64KEY,
+            &mut key,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let result = action(key);
+    // SAFETY: key is the valid handle returned by RegOpenKeyExW above.
+    unsafe { RegCloseKey(key) };
+    result
+}
+
+fn write_setting_manifest(operation_dir: &Path, manifest: &SettingManifest) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(operation_dir.join("operation.json"))?;
+    serde_json::to_writer(&mut file, manifest).map_err(io::Error::other)?;
+    file.sync_all()
+}
+
+fn append_setting_event(operation_dir: &Path, event: SettingJournalEvent) -> io::Result<()> {
+    let path = operation_dir.join("events.jsonl");
+    if let Ok(metadata) = fs::symlink_metadata(&path)
+        && (!metadata.is_file() || is_reparse_point(&metadata))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "journal thiết lập không hợp lệ",
+        ));
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(&mut file, &event).map_err(io::Error::other)?;
+    file.write_all(b"\n")?;
+    file.sync_all()
+}
+
+fn read_setting_manifest(operation_dir: &Path) -> io::Result<SettingManifest> {
+    let metadata = fs::symlink_metadata(operation_dir)?;
+    if !metadata.is_dir() || is_reparse_point(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "thư mục thao tác thiết lập không hợp lệ",
+        ));
+    }
+    let path = operation_dir.join("operation.json");
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || is_reparse_point(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "manifest thiết lập không hợp lệ",
+        ));
+    }
+    let manifest: SettingManifest =
+        serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)?;
+    if manifest.id
+        != operation_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .as_ref()
+        || manifest.operation_id != SHOW_FILE_EXTENSIONS_OPERATION_ID
+        || !manifest.key_existed
+        || manifest.registry_view != KEY_WOW64_64KEY
+        || setting_operation_order(&manifest.id).is_none()
+        || manifest.original.as_ref() == Some(&shown_extensions_value())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "phạm vi manifest thiết lập không hợp lệ",
+        ));
+    }
+    Ok(manifest)
+}
+
+fn setting_history_for_dir(operation_dir: &Path) -> io::Result<SettingHistory> {
+    let manifest = read_setting_manifest(operation_dir)?;
+    let events_path = operation_dir.join("events.jsonl");
+    let mut event_status = None;
+    let mut event_message = None;
+    if let Ok(metadata) = fs::symlink_metadata(&events_path)
+        && (!metadata.is_file() || is_reparse_point(&metadata))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "journal thiết lập không hợp lệ",
+        ));
+    }
+    if let Ok(bytes) = fs::read(events_path) {
+        let valid_length = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        for line in bytes[..valid_length].split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let event: SettingJournalEvent =
+                serde_json::from_slice(line).map_err(io::Error::other)?;
+            event_status = Some(event.status);
+            event_message = event.message;
+        }
+    }
+    let current = read_explorer_value();
+    let (status, message) = match &current {
+        Ok(current) => reconcile_setting_state(
+            event_status,
+            event_message,
+            current.as_ref(),
+            manifest.original.as_ref(),
+            &shown_extensions_value(),
+        ),
+        Err(error) => (SettingStatus::Failed, Some(error.to_string())),
+    };
+    Ok(SettingHistory {
+        id: manifest.id,
+        operation_id: manifest.operation_id,
+        created_unix_seconds: manifest.created_unix_seconds,
+        original: manifest.original,
+        current: current.ok().flatten(),
+        status,
+        message,
+    })
+}
+
+fn reconcile_setting_state(
+    event_status: Option<SettingStatus>,
+    event_message: Option<String>,
+    current: Option<&RegistryValue>,
+    original: Option<&RegistryValue>,
+    applied: &RegistryValue,
+) -> (SettingStatus, Option<String>) {
+    match event_status {
+        Some(SettingStatus::Restored) => (
+            SettingStatus::Restored,
+            (current != original)
+                .then(|| "đã khôi phục trước đây; giá trị đã đổi sau thao tác này".to_owned()),
+        ),
+        Some(SettingStatus::Failed) => (SettingStatus::Failed, event_message),
+        Some(SettingStatus::Conflict) => (SettingStatus::Conflict, event_message),
+        _ if current == Some(applied) => (SettingStatus::Applied, None),
+        _ if current == original => (
+            if event_status == Some(SettingStatus::Applied) {
+                SettingStatus::Restored
+            } else {
+                SettingStatus::Interrupted
+            },
+            (event_status != Some(SettingStatus::Applied)).then(|| {
+                "giá trị hiện tại bằng giá trị gốc; chưa xác nhận thao tác đã áp dụng".to_owned()
+            }),
+        ),
+        _ => (
+            SettingStatus::Conflict,
+            Some("giá trị hiện tại khác cả giá trị đã áp dụng và giá trị gốc".to_owned()),
+        ),
+    }
+}
+
 pub fn local_storage_root() -> io::Result<PathBuf> {
     let local_app_data = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -994,6 +1584,20 @@ fn temp_workspace() -> PathBuf {
 mod tests {
     use super::*;
 
+    struct TestRegistryKey(String);
+
+    impl Drop for TestRegistryKey {
+        fn drop(&mut self) {
+            let path = self
+                .0
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            // SAFETY: this test-owned unique key path is nul-terminated and isolated under HKCU\\Software.
+            unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, path.as_ptr()) };
+        }
+    }
+
     fn make_file(path: &Path, contents: &[u8]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, contents).unwrap();
@@ -1197,5 +1801,175 @@ mod tests {
     fn format_bytes_uses_binary_units() {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(1024), "1.0 KB");
+    }
+
+    #[test]
+    fn registry_restore_refuses_values_changed_after_apply() {
+        let original = RegistryValue {
+            kind: 3,
+            data: vec![0x01, 0x02],
+        };
+        let applied = shown_extensions_value();
+        let changed = RegistryValue {
+            kind: REG_DWORD,
+            data: 1_u32.to_le_bytes().to_vec(),
+        };
+
+        assert_eq!(
+            registry_restore_decision(Some(&applied), Some(&original), &applied),
+            RegistryRestoreDecision::Restore
+        );
+        assert_eq!(
+            registry_restore_decision(Some(&original), Some(&original), &applied),
+            RegistryRestoreDecision::AlreadyRestored
+        );
+        assert_eq!(
+            registry_restore_decision(None, None, &applied),
+            RegistryRestoreDecision::AlreadyRestored
+        );
+        assert_eq!(
+            registry_restore_decision(Some(&changed), Some(&original), &applied),
+            RegistryRestoreDecision::Conflict
+        );
+        assert_eq!(
+            registry_restore_decision(
+                Some(&RegistryValue {
+                    kind: 3,
+                    data: vec![1, 3]
+                }),
+                Some(&original),
+                &applied
+            ),
+            RegistryRestoreDecision::Conflict
+        );
+    }
+
+    #[test]
+    fn setting_restore_only_targets_the_newest_active_apply() {
+        let history = [
+            SettingHistory {
+                id: "100-1-0".to_owned(),
+                operation_id: SHOW_FILE_EXTENSIONS_OPERATION_ID.to_owned(),
+                created_unix_seconds: 1,
+                original: None,
+                current: None,
+                status: SettingStatus::Applied,
+                message: None,
+            },
+            SettingHistory {
+                id: "100-1-10".to_owned(),
+                operation_id: SHOW_FILE_EXTENSIONS_OPERATION_ID.to_owned(),
+                created_unix_seconds: 1,
+                original: None,
+                current: None,
+                status: SettingStatus::Applied,
+                message: None,
+            },
+            SettingHistory {
+                id: "101-1-0".to_owned(),
+                operation_id: SHOW_FILE_EXTENSIONS_OPERATION_ID.to_owned(),
+                created_unix_seconds: 1,
+                original: None,
+                current: None,
+                status: SettingStatus::Restored,
+                message: None,
+            },
+        ];
+
+        assert_eq!(latest_applied_setting_id(&history), Some("100-1-10"));
+        assert!(setting_operation_order("malformed").is_none());
+        assert!(setting_operation_order("100-1-10-extra").is_none());
+    }
+
+    #[test]
+    fn restored_setting_history_stays_terminal_after_a_later_apply() {
+        let original = RegistryValue {
+            kind: REG_DWORD,
+            data: 1_u32.to_le_bytes().to_vec(),
+        };
+        let applied = shown_extensions_value();
+
+        let (status, message) = reconcile_setting_state(
+            Some(SettingStatus::Restored),
+            None,
+            Some(&applied),
+            Some(&original),
+            &applied,
+        );
+        assert_eq!(status, SettingStatus::Restored);
+        assert!(message.is_some());
+
+        let (status, _) = reconcile_setting_state(
+            Some(SettingStatus::Failed),
+            Some("failed".to_owned()),
+            Some(&applied),
+            Some(&original),
+            &applied,
+        );
+        assert_eq!(status, SettingStatus::Failed);
+    }
+
+    #[test]
+    fn interrupted_setting_that_still_matches_target_remains_recoverable() {
+        let original = RegistryValue {
+            kind: REG_DWORD,
+            data: 1_u32.to_le_bytes().to_vec(),
+        };
+        let applied = shown_extensions_value();
+        let (status, _) = reconcile_setting_state(
+            Some(SettingStatus::Interrupted),
+            Some("verification was interrupted".to_owned()),
+            Some(&applied),
+            Some(&original),
+            &applied,
+        );
+        assert_eq!(status, SettingStatus::Applied);
+    }
+
+    #[test]
+    fn registry_helpers_round_trip_raw_data_in_an_isolated_hkcu_key() {
+        let key_path = format!(
+            "Software\\DebloatX.RegistryTest.{}.{}",
+            std::process::id(),
+            new_operation_id()
+        );
+        let wide_path = key_path
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut key = null_mut();
+        let mut disposition = 0;
+        // SAFETY: the path is nul-terminated and the output pointers are valid for the call.
+        let status = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                wide_path.as_ptr(),
+                0,
+                null(),
+                0,
+                KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY,
+                null(),
+                &mut key,
+                &mut disposition,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        // SAFETY: key is the handle returned by RegCreateKeyExW.
+        unsafe { RegCloseKey(key) };
+        assert_eq!(disposition, REG_CREATED_NEW_KEY);
+        let _cleanup = TestRegistryKey(key_path.clone());
+
+        let original = RegistryValue {
+            kind: REG_BINARY,
+            data: vec![0x00, 0x7f, 0xff],
+        };
+        assert_eq!(read_registry_value(&key_path, "TestValue").unwrap(), None);
+        write_registry_value(&key_path, "TestValue", Some(&original)).unwrap();
+        assert_eq!(
+            read_registry_value(&key_path, "TestValue").unwrap(),
+            Some(original)
+        );
+        write_registry_value(&key_path, "TestValue", None).unwrap();
+        assert_eq!(read_registry_value(&key_path, "TestValue").unwrap(), None);
     }
 }

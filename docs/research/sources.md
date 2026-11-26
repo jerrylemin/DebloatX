@@ -4,7 +4,7 @@ Checked on 2026-11-27. The repository list and branch/status values in the proje
 
 | # | Repository | Revision and license | Survey status |
 | ---: | --- | --- | --- |
-| 1 | [Raphire/Win11Debloat](https://github.com/Raphire/Win11Debloat) | Not pinned; license not checked | Pending: entry point, presets, OS operations, and tests |
+| 1 | [Raphire/Win11Debloat](https://github.com/Raphire/Win11Debloat) | Commit [`5d88bfe9ef2be5a8a643166a6400eb78a30c46ec`](https://github.com/Raphire/Win11Debloat/tree/5d88bfe9ef2be5a8a643166a6400eb78a30c46ec); MIT per [`LICENSE`](https://github.com/Raphire/Win11Debloat/blob/5d88bfe9ef2be5a8a643166a6400eb78a30c46ec/LICENSE) | Partial survey: the standalone [`Show_Extensions_For_Known_File_Types.reg`](https://github.com/Raphire/Win11Debloat/blob/5d88bfe9ef2be5a8a643166a6400eb78a30c46ec/Regfiles/Show_Extensions_For_Known_File_Types.reg) sets HKCU Explorer `HideFileExt` to DWORD 0. Broader CLI/GUI routing, presets, and tests remain pending; no upstream code or registry file copied |
 | 2 | [ChrisTitusTech/winutil](https://github.com/ChrisTitusTech/winutil) | Not pinned; license not checked | Pending: entry point, scripts, configuration, and tests |
 | 3 | [memstechtips/Winhance](https://github.com/memstechtips/Winhance) | Not pinned; license not checked | Pending: entry point, UI, services, and tests |
 | 4 | [farag2/Sophia-Script-for-Windows](https://github.com/farag2/Sophia-Script-for-Windows) | Not pinned; license not checked | Pending: presets, scripts, configuration, and tests |
