@@ -1,6 +1,6 @@
 # Behavior coverage
 
-Coverage is intentionally partial. Sources #1 (Win11Debloat) and #20 (BleachBit) have pinned revisions; source #1 has only been surveyed for the Explorer setting below. `verified` means the upstream behavior was traced to source at that revision; `implemented` means DebloatX code and tests cover the behavior on this checkout. The remaining sources and behavior families are not yet surveyed or classified as product exclusions.
+Coverage is intentionally partial. Sources #1 (Win11Debloat) and #20 (BleachBit) have pinned behavior surveys; source #2 (WinUtil) has a pinned partial survey for the End Task taskbar setting. Source #1's broader CLI/UI/preset/test paths remain pending. `verified` means the upstream behavior was traced to source at that revision; `implemented` means DebloatX code and tests cover the behavior on this checkout. The remaining sources and behavior families are not yet surveyed or classified as product exclusions.
 
 ## Implemented first slice
 
@@ -19,6 +19,12 @@ Coverage is intentionally partial. Sources #1 (Win11Debloat) and #20 (BleachBit)
 | --- | --- | --- | --- | --- | --- | --- |
 | `WINDOWS.EXPLORER.EXTENSIONS.001` | #1 standalone [registry file](https://github.com/Raphire/Win11Debloat/blob/5d88bfe9ef2be5a8a643166a6400eb78a30c46ec/Regfiles/Show_Extensions_For_Known_File_Types.reg) sets `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\\HideFileExt` to `REG_DWORD 0`; independent implementation in [`src/lib.rs`](../../src/lib.rs) and [`src/main.rs`](../../src/main.rs) | Explorer Advanced key must already exist; current account and explicit 64-bit registry view; no admin rights | Captures value existence, type, and bytes → writes `REG_DWORD 0` after preview and confirmation | Rechecks preview state before apply; shows the target and scope; Explorer may need reopening; no key is created if absent | Journal and manifest preserve the original optional raw value plus key/view; restore only when the live value matches the applied DWORD or is already original; older active records cannot undo a newer apply; isolated registry and restore-history tests pass | upstream behavior verified; code implemented; 13 core tests passed; live Explorer apply not performed |
 
+## Verified upstream behavior, not implemented
+
+| ID | Source/evidence | Preconditions and scope | Before → after | Options and risk | Undo and verification | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| `WINDOWS.TASKBAR.END_TASK.001` | #2 [`tweaks.json`](https://github.com/ChrisTitusTech/winutil/blob/70c23c80641d7370532af2f619b2842658600842/config/tweaks.json#L920-L935), [`preset.json`](https://github.com/ChrisTitusTech/winutil/blob/70c23c80641d7370532af2f619b2842658600842/config/preset.json#L1-L40), and [Microsoft's Windows 11 22H2 update notes](https://support.microsoft.com/en-us/servicing/os/configuration-updates/2023/08/september-26-2023-windows-configuration-update) | Windows 11 version 22H2 with the feature update available; applies to the current user's HKCU taskbar developer settings | `TaskbarEndTask` absent or disabled → `REG_DWORD 1`, adding End task to an app's taskbar context menu | WinUtil includes this in Standard and Advanced presets, not Minimal. The taskbar command can terminate an app before it saves work; a DebloatX implementation needs explicit preview and confirmation. | WinUtil's `OriginalValue="<RemoveEntry>"` undo removes the value instead of restoring any prior raw value; its registry helper also creates a missing child key. The inspected generic Pester tests do not test this setting against Windows. A DebloatX implementation must preserve the exact previous value and key state and guard against external changes. | verified upstream; not implemented in DebloatX |
+
 ## Known limits of this slice
 
 - No permanent deletion exists in this slice; there is no permanent-delete path to verify.
@@ -30,4 +36,4 @@ Coverage is intentionally partial. Sources #1 (Win11Debloat) and #20 (BleachBit)
 
 ## Remaining source survey
 
-Source #1 is only partially surveyed as recorded above; sources #2–19 and #21–35 remain pending revision/license/runtime-path verification. Source #13 also needs an availability/provenance recheck. Until those surveys are done, no other behavior from those projects is claimed as verified, merged, excluded, or fully covered. Current planned families needing per-behavior decisions include AppX/MSIX and Win32 uninstall, other Windows settings/services/tasks, rule-driven cleaners, disk/duplicate analysis, MSI cache, Driver Store, Windows features, and app install/update flows.
+Sources #1 and #2 are only partially surveyed as recorded above; sources #3–19 and #21–35 remain pending revision/license/runtime-path verification. Source #13 also needs an availability/provenance recheck. Until those surveys are done, no other behavior from those projects is claimed as verified, merged, excluded, or fully covered. Current planned families needing per-behavior decisions include AppX/MSIX and Win32 uninstall, other Windows settings/services/tasks, rule-driven cleaners, disk/duplicate analysis, MSI cache, Driver Store, Windows features, and app install/update flows.
